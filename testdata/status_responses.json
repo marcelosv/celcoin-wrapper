@@ -1,0 +1,32 @@
+{
+  "items": [
+    {
+      "id": "c0a8-001",
+      "movementType": "PIXPAYMENTOUT",
+      "bookingDate": "2025-10-10T18:13:21Z",
+      "amount": 1250.5,
+      "currency": "BRL",
+      "description": "Pix para Fornecedor X",
+      "endToEndId": "E1...",
+      "nsu": "NSU123",
+      "channel": "PIX",
+      "clientCode": "cli-001",
+      "counterparty": {"name":"Fornecedor X"}
+    },
+    {
+      "id": "c0a8-002",
+      "movementType": "PIXPAYMENTIN",
+      "bookingDate": "2025-10-12T09:03:00Z",
+      "amount": 300.0,
+      "currency": "BRL",
+      "description": "Recebimento PIX",
+      "endToEndId": "E2...",
+      "nsu": "NSU456",
+      "channel": "PIX",
+      "clientCode": "cli-002",
+      "counterparty": {"name":"Cliente Y"}
+    }
+  ],
+  "page": 1,
+  "pageSize": 50
+}
