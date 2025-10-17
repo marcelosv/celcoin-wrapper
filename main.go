@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,105 @@ func getenv(key, def string) string {
 		return def
 	}
 	return v
+}
+
+// --- Pix Out: create payment ---
+func pixOutCreateHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    idem := r.Header.Get("Idempotency-Key")
+    var body struct {
+        AccountProviderId string  `json:"accountProviderId"`
+        Amount            float64 `json:"amount"`
+        Currency          string  `json:"currency"`
+        Description       string  `json:"description"`
+        PixKey            string  `json:"pixKey"`
+        Beneficiary       map[string]any `json:"beneficiary"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+        badRequest(w, "invalid json")
+        return
+    }
+    if body.Currency == "" {
+        body.Currency = "BRL"
+    }
+    now := time.Now().UTC()
+    pid := genID("pay")
+    p := &Payment{
+        ID:        pid,
+        Status:    "PROCESSING",
+        Amount:    body.Amount,
+        Currency:  body.Currency,
+        EndToEndId: genID("E2E"),
+        TxId:      genID("TX"),
+        Nsu:       genID("NSU"),
+        CreatedAt: now,
+        UpdatedAt: now,
+    }
+    p = pstore.Create(idem, p)
+    w.Header().Set("Location", "/baas/v2/pix/out/payments/"+p.ID)
+    mustJSON(w, http.StatusCreated, p)
+}
+
+// --- Pix Out: payment status by ID ---
+func pixOutGetHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    segments := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+    if len(segments) < 6 { // baas v2 pix out payments {id}
+        badRequest(w, "invalid path")
+        return
+    }
+    id := segments[5]
+    p, ok := pstore.Get(id)
+    if !ok {
+        mustJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+        return
+    }
+    mustJSON(w, http.StatusOK, p)
+}
+
+// --- Pix Out: QR Code parse ---
+func qrParseHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    var body struct{ EMV string `json:"emv"` }
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.EMV == "" {
+        badRequest(w, "invalid json or missing emv")
+        return
+    }
+    // Mock parse output deterministically using lengths
+    resp := map[string]any{
+        "txId":   genID("TX"),
+        "merchant": "Mock Merchant",
+        "amount":  123.45,
+        "city":    "Sao Paulo",
+        "key":     "mock-pix-key",
+        "e2eId":   genID("E2E"),
+    }
+    mustJSON(w, http.StatusOK, resp)
+}
+
+// --- Pix ITP: create consent ---
+func itpConsentsHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    // We accept any JSON body for the mock
+    _, _ = io.ReadAll(r.Body)
+    resp := map[string]any{
+        "consentId": genID("consent"),
+        "status":    "AWAITING_AUTHORIZATION",
+        "expiresAt": time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339),
+    }
+    mustJSON(w, http.StatusCreated, resp)
 }
 
 func mustJSON(w http.ResponseWriter, status int, v any) {
@@ -73,6 +173,67 @@ type StatementsData struct {
 	OpeningBalance float64 `json:"openingBalance"`
 	ClosingBalance float64 `json:"closingBalance"`
 	Currency       string  `json:"currency"`
+}
+
+type Payment struct {
+	ID        string                 `json:"id"`
+	Status    string                 `json:"status"`
+	StatusReason string              `json:"statusReason,omitempty"`
+	Amount    float64                `json:"amount"`
+	Currency  string                 `json:"currency"`
+	EndToEndId string                `json:"endToEndId"`
+	TxId      string                 `json:"txId"`
+	Nsu       string                 `json:"nsu"`
+	Receipt   map[string]any         `json:"receipt,omitempty"`
+	CreatedAt time.Time              `json:"createdAt"`
+	UpdatedAt time.Time              `json:"updatedAt"`
+}
+
+type PaymentStore struct {
+	mu   sync.Mutex
+	byID map[string]*Payment
+	byKey map[string]*Payment // Idempotency-Key
+}
+
+var pstore = &PaymentStore{byID: map[string]*Payment{}, byKey: map[string]*Payment{}}
+
+func genID(prefix string) string {
+	// simple deterministic-ish id based on time
+	return fmt.Sprintf("%s_%x", prefix, time.Now().UnixNano())
+}
+
+func (s *PaymentStore) Create(idemKey string, p *Payment) *Payment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idemKey != "" {
+		if ex, ok := s.byKey[idemKey]; ok {
+			return ex
+		}
+	}
+	s.byID[p.ID] = p
+	if idemKey != "" {
+		s.byKey[idemKey] = p
+	}
+	return p
+}
+
+func (s *PaymentStore) Get(id string) (*Payment, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.byID[id]
+	if !ok {
+		return nil, false
+	}
+	// simple status progression: after 2s, go to SUCCESS
+	if p.Status == "PROCESSING" && time.Since(p.CreatedAt) > 2*time.Second {
+		p.Status = "SUCCESS"
+		p.StatusReason = ""
+		p.UpdatedAt = time.Now().UTC()
+		if p.Receipt == nil {
+			p.Receipt = map[string]any{"url": "https://example.test/receipt/" + p.ID}
+		}
+	}
+	return p, true
 }
 
 func loadJSON[T any](path string, dst *T) error {
@@ -118,6 +279,24 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	mustJSON(w, http.StatusOK, map[string]any{
+		"access_token": "mock-token",
+		"token_type":   "Bearer",
+		"expires_in":   2400,
+	})
+}
+
+// OAuth2 client_credentials via form-urlencoded (spec alternative)
+func oauthTokenHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		badRequest(w, "invalid form")
+		return
+	}
+	// Optionally validate r.Form.Get("grant_type"), client_id, client_secret, audience
 	mustJSON(w, http.StatusOK, map[string]any{
 		"access_token": "mock-token",
 		"token_type":   "Bearer",
@@ -246,8 +425,13 @@ func buildMux(testdataDir string, webhookTarget, webhookBearer, webhookHMAC stri
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/v5/token", tokenHandler)
+	mux.HandleFunc("/oauth/token", oauthTokenHandler)
 	mux.HandleFunc("/baas/v2/status", requireBearer(statusHandler(testdataDir)))
 	mux.HandleFunc("/baas/v2/accounts/", requireBearer(statementsHandler(testdataDir)))
+	mux.HandleFunc("/baas/v2/pix/out/payments", requireBearer(pixOutCreateHandler))
+	mux.HandleFunc("/baas/v2/pix/out/payments/", requireBearer(pixOutGetHandler))
+	mux.HandleFunc("/baas/v2/pix/out/qrcode/parse", requireBearer(qrParseHandler))
+	mux.HandleFunc("/baas/v2/pix/itp/consents", requireBearer(itpConsentsHandler))
 	mux.HandleFunc("/_admin/fire-webhook", fireWebhookHandler(webhookTarget, webhookBearer, webhookHMAC))
 
 	// Optional webhook register route
